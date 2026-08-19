@@ -1,0 +1,6 @@
+interface:
+  display_name: "Android Kernel LKM"
+  short_description: "Develop Android kernel modules (KO/LKM) with kprobe/kretprobe"
+  default_prompt: "Use $android-kernel-lkm to develop an Android kernel module (KO/LKM) following the full workflow: feasibility research, baseline extraction, iterative development, static verification, insmod testing, and packaging."
+policy:
+  allow_implicit_invocation: true
