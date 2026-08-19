@@ -134,8 +134,23 @@ adb shell "for m in /sys/module/*/; do cat \$m/... 2>/dev/null; done"  # 依设�
 
 # 保存到 abi/vermagic.txt / save to abi/vermagic.txt
 
-# 2. Symbol CRC 表 / Symbol CRC table
-adb shell cat /proc/module_symvers > crc/Module.symvers
+# 2. Symbol CRC —— 从已加载的 ko 模块文件内提取，而不是 /proc/module_symvers
+#    Symbol CRC — extract from the LOADED ko module files, NOT /proc/module_symvers
+#    已加载 ko 的 __versions 段是内核实际认可的 CRC 基准
+#    the __versions section of loaded ko files is the CRC baseline the kernel actually accepts
+#    /proc/module_symvers 只作参考，不作为精确基准
+#    /proc/module_symvers is reference only, not the precise baseline
+
+# 把已加载的 vendor ko 拉到 PC 端 / pull the loaded vendor ko(s) to the PC
+adb pull /vendor/lib/modules/<已加载的vendor模块>.ko crc/vendor.ko
+
+# 用 readelf 解析 ko 的 __versions 段，生成 CRC 表（符号名 + CRC 值）
+# parse the __versions section with readelf to build the CRC table (symbol name + CRC)
+llvm-readelf -x __versions crc/vendor.ko   # 或 readelf / 或脚本解析 / or a script to parse
+# 解析出的每项为：CRC(4字节) + 符号名 -> 写入 crc/Module.symvers 格式
+# each entry: CRC(4 bytes) + symbol name -> write in Module.symvers format
+
+# 保存到 crc/Module.symvers（格式：<crc> <symbol>）/ save to crc/Module.symvers (<crc> <symbol>)
 
 # 3. 内核头文件 / kernel headers
 adb shell "tar czf /data/local/tmp/kheaders.tar.gz -C /lib/modules/$(uname -r) build"
@@ -367,7 +382,7 @@ static int temp_band(void) {
 ### 5d. 静态核对（每次迭代必须完整触发）/ Static Verification (must fully trigger every iteration)
 
 1. **vermagic 核对 / vermagic check**：模块 vermagic == 目标设备 vermagic / module vermagic == target device vermagic
-2. **CRC 核对 / CRC check**：`__versions` 段中每个符号的 CRC == `Module.symvers` / every symbol CRC in `__versions` == `Module.symvers`
+2. **CRC 核对 / CRC check**：模块 `__versions` 段中每个符号的 CRC == 从已加载 ko 提取的 CRC 基准（`crc/Module.symvers`）/ every symbol CRC in the module's `__versions` == the CRC baseline extracted from loaded ko files (`crc/Module.symvers`)
 3. **KCFI type ID 核对 / KCFI type ID check**：`init_module`/`cleanup_module` type ID == 目标内核 / == target kernel
 4. **未声明符号检查 / undeclared symbol check**：`llvm-nm -u` 输出的符号必须都在 `__versions` 中 / symbols from `llvm-nm -u` must all be in `__versions`
 5. **section 完整性 / section completeness**：`__versions`、`__version_ext_crcs`、`__version_ext_names`、`.init.eh_frame`、`.note.Linux` 都存在 / all present
@@ -377,8 +392,8 @@ static int temp_band(void) {
 $READELF -S MODULE.ko | grep -E '__versions|__version_ext'
 $NM -u MODULE.ko
 $NM -a MODULE.ko | grep '__kcfi_typeid_init_module'
-# CRC 核对脚本（从 Module.symvers 逐符号对比）
-# CRC check script (compare symbol by symbol from Module.symvers)
+# CRC 核对脚本（从已加载 ko 提取的 CRC 基准逐符号对比）
+# CRC check script (compare symbol by symbol against the CRC baseline extracted from loaded ko files)
 ```
 
 **任一核对失败 → 停下修复，不进入 insmod。**
