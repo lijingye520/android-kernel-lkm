@@ -386,27 +386,61 @@ $NM -a MODULE.ko | grep '__kcfi_typeid_init_module'
 
 ### 5e. insmod 实测 / insmod Testing
 
+**核心原则：hook 注册成功、计数器增加、日志出现 ≠ 功能真正生效。**
+**Core principle: hook registered, counter incrementing, or log messages appearing ≠ the feature is actually working.**
+
+必须**综合多个维度**验证，不能只看单一证据：
+Must verify from **multiple dimensions**, not rely on a single piece of evidence:
+
+1. **内核日志 / kernel log**：hook 是否注册成功、有无 error（仅证明 hook 装上）
+   Log confirms the hook is attached — nothing more.
+2. **模块参数计数器 / module parameter counters**：`hits` 是否增加（仅证明回调被触发）
+   Counters prove callbacks fire — not that the result took effect.
+3. **设备实际节点 / device actual nodes**：sysfs、proc、debugfs 中的真实状态值
+   Read actual state from sysfs/proc/debugfs nodes.
+4. **实际行为效果 / real behavior effect**：物理/功能层面的最终结果
+   Verify the final physical/functional outcome.
+
 ```bash
 # 推送并加载 / push and load
 adb push out/MODULE.ko /data/local/tmp/
 adb shell su -c "insmod /data/local/tmp/MODULE.ko enabled=1 observe=1"
 
-# 检查是否加载成功 / check if loaded successfully
+# 维度1：检查是否加载成功 + hook 注册 / dimension 1: loaded + hook registered
 adb shell su -c "ls /sys/module/MODULE_NAME/"
-
-# 观察计数器（验证本轮目标是否生效）/ observe counter (verify this round's goal)
 adb shell su -c "cat /sys/module/MODULE_NAME/parameters/hits"
-
-# 观察内核日志 / observe kernel log
 adb shell su -c "dmesg | grep MODULE_NAME | tail -50"
+
+# 维度2：设备实际节点 —— 读取真实状态（以充电为例，按需求替换）
+# dimension 2: device actual nodes — read real state (charging example; replace per requirement)
+adb shell su -c "cat /sys/class/power_supply/battery/current_now"   # 实际充电电流 / actual charge current
+adb shell su -c "cat /sys/class/power_supply/battery/voltage_now"   # 实际电压 / actual voltage
+adb shell su -c "cat /sys/class/power_supply/battery/temp"          # 实际温度 / actual temperature
+adb shell su -c "for tz in /sys/class/thermal/thermal_zone*/; do echo \"$tz: $(cat $tz/type) = $(cat $tz/temp)\"; done"  # 热区 / thermal zones
+
+# 维度3：实际行为效果 —— 物理/功能层面（以显示超频为例）
+# dimension 3: real behavior effect — physical/functional level (display overclock example)
+adb shell su -c "dumpsys SurfaceFlinger --display-id 0"   # 模式列表是否含新模式 / new modes present?
+adb shell su -c "cat /sys/module/MODULE_NAME/parameters/te_count"  # TE 是否按目标刷新率增长 / TE rising at target rate?
+
+# 维度4：综合判断 —— 多个维度相互印证，全部吻合才算生效
+# dimension 4: combined judgment — multiple dimensions corroborate; only when all match is it effective
 ```
 
-**通过标准：本轮迭代的既定工作目标完成。**
-**Pass criteria: this iteration's defined working goal is complete.**
+**判定示例 / Judgment examples**：
+- 充电电流修改：不能只看 `ichg_hits > 0`，必须 `battery/current_now` 实际到达目标值、且持续稳定
+  Charging current: not just `ichg_hits > 0`; `battery/current_now` must actually reach the target and stay stable.
+- 温度伪装：不能只看 `temp_spoof_hits > 0`，必须 `battery/temp`、thermal_zone、FG 读数都显示伪装值
+  Temp spoof: not just `temp_spoof_hits > 0`; battery/temp, thermal zone, and FG readings must all show the spoofed value.
+- 显示超频：不能只看模式枚举数增加，必须 `te_count` 按 176/185Hz 速率增长、无 timeout/underrun/黑屏花屏
+  Display overclock: not just mode count increase; `te_count` must rise at 176/185Hz rate with no timeout/underrun/black/flicker.
+
+**通过标准：本轮迭代的既定工作目标完成，且经设备实际节点 + 实际行为效果综合验证成立。**
+**Pass criteria: this iteration's defined working goal is complete AND corroborated by device actual nodes + real behavior effect.**
 
 - 通过 → 下一轮迭代 / pass → next iteration
-- 失败（崩溃/无效/异常）→ 修复 → 重新静态核对 → 重新实测
-  fail (crash/invalid/abnormal) → fix → re-verify statically → re-test
+- 失败（崩溃/无效/异常/节点值未变化）→ 修复 → 重新静态核对 → 重新实测
+  fail (crash/invalid/abnormal/nodes unchanged) → fix → re-verify statically → re-test
 - 如果 `insmod` 后系统崩溃重启：**优先检查 KCFI 整数规范化**（`-fsanitize-cfi-icall-experimental-normalize-integers` 与 `CONFIG_CFI_ICALL_NORMALIZE_INTEGERS` 是否一致）
   If the system crashes/reboots after `insmod`: **first check KCFI integer normalization** (does `-fsanitize-cfi-icall-experimental-normalize-integers` match `CONFIG_CFI_ICALL_NORMALIZE_INTEGERS`?)
 
