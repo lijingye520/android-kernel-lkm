@@ -161,9 +161,35 @@ grep CONFIG_CFI_ICALL_NORMALIZE_INTEGERS kheaders/include/generated/autoconf.h
 # 必须记录：目标内核是否启用整数规范化
 # must record: does the target kernel enable integer normalization
 
-# 5. 确认 Clang 版本（与内核构建版本一致）
-#    confirm Clang version (must match kernel build version)
-$CLANG --version | head -1
+# 5. 确定编译器（Clang）—— 不猜版本，用「读真值 + 实测对照」校验
+#    Determine compiler (Clang) — DON'T guess the version; use "read truth + test-compare"
+
+# 核心：一台设备到底配哪个 clang 不重要，能不能对上真值才重要。
+# Core: which clang the device "should" use doesn't matter; whether it matches the truth matters.
+
+# 5a. 从任何能加载成功的 ko 里，读出设备认可的 KCFI hash（.init.text 首 word）
+#     5a. read the KCFI hash the device accepts from any ko that loads successfully (.init.text first word)
+llvm-readelf -x .init.text abi/vendor.ko   # 取 .init.text 首 4 字节 = 设备认可的 KCFI type hash
+#     （即 init_module 的 KCFI type ID，设备加载成功 = 该 hash 有效）
+
+# 5b. 用本机 clang 按同样 KCFI flags 编译，看算出的 hash
+#     5b. compile a test object with the local clang using the same KCFI flags, check the produced hash
+$CLANG --version | head -1   # 本机当前 clang / current local clang
+$CLANG -fsanitize=kcfi -fsanitize-cfi-icall-experimental-normalize-integers \
+    -c test.c -o test.o
+llvm-nm -a test.o | grep '__kcfi_typeid_init_module'   # 算出本机 clang 的 init_module hash
+
+# 5c. 对照判断 / 5c. compare and decide
+#     一致 → 直接用本机 clang；不一致 → 才需换编译器
+#     match → use the local clang directly; mismatch → then switch compiler
+
+# 编译器获取优先级 / compiler acquisition priority:
+#   1) 设备已有编译器且匹配真值 → 直接用，不强制安装对应版本
+#      device already has a compiler and it matches the truth → use it, don't force-install the "matching" version
+#   2) 设备没有编译器 → 优先下载对应版本；下载不到对应版本就下载版本相近的，再用上述方法核对
+#      no compiler on device → try to download the corresponding version; if unavailable, download a nearby version, then verify with the method above
+#   3) 设备已有编译器但核对不一致 → 才安装对应版本
+#      device has a compiler but the check mismatches → then install the corresponding version
 ```
 
 **产物目录结构 / Artifact directory structure**：
