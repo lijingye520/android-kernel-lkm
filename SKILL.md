@@ -57,8 +57,14 @@ Search related open-source projects (similar KO/LKM for charging/display/thermal
 Extract information from the target device and verify:
 
 ```bash
-# 内核版本与 vermagic / kernel version and vermagic
+# 设备内核 release 串（仅参考，NOT vermagic 基准）
+# device kernel release string (reference only, NOT the vermagic baseline)
 adb shell cat /proc/version
+
+# 已加载的内核模块 —— vermagic 以这些已成功加载的模块为基准
+# loaded kernel modules — vermagic is based on these successfully loaded modules
+adb shell lsmod
+adb shell cat /proc/modules
 
 # 符号表（确认目标函数是否存在、是否被剥离）
 # symbol table (verify target functions exist and are not stripped)
@@ -110,9 +116,22 @@ Combine GitHub approaches with device reality to form your own judgment:
 从设备提取所有构建依赖 / Extract all build dependencies from the device:
 
 ```bash
-# 1. vermagic（从 vendor 模块获取，不要从 uname 猜）
-#    vermagic (get from vendor module, don't guess from uname)
-adb shell modinfo /vendor/lib/modules/some_module.ko | grep vermagic
+# 1. vermagic —— 以系统已加载的内核模块为基准，而不是设备内核版本
+#    vermagic — based on the system's LOADED kernel modules, NOT the device kernel version
+#    uname -r 是设备 release 串，vermagic 是 vendor 模块加载器的标识，两者可能不同
+#    uname -r is the device release string; vermagic identifies the vendor module loader; they can differ
+#    必须用 modinfo 从已加载（能被内核成功识别）的 vendor 模块取得 vermagic
+#    must get vermagic via modinfo from a LOADED vendor module that the kernel accepts
+
+# 先列出已加载的模块 / first list loaded modules
+adb shell lsmod
+
+# 从已加载的 vendor 模块获取 vermagic（ko 文件路径需根据设备实际确定）
+# get vermagic from a loaded vendor module (ko path depends on the device)
+adb shell modinfo /vendor/lib/modules/<已加载的vendor模块>.ko | grep vermagic
+# 或从 /sys/module 下已加载模块直接确认 / or confirm from loaded modules under /sys/module
+adb shell "for m in /sys/module/*/; do cat \$m/... 2>/dev/null; done"  # 依设备而定 / device-dependent
+
 # 保存到 abi/vermagic.txt / save to abi/vermagic.txt
 
 # 2. Symbol CRC 表 / Symbol CRC table
