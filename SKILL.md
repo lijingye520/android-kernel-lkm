@@ -116,41 +116,40 @@ Combine GitHub approaches with device reality to form your own judgment:
 从设备提取所有构建依赖 / Extract all build dependencies from the device:
 
 ```bash
-# 1. vermagic —— 以系统已加载的内核模块为基准，而不是设备内核版本
-#    vermagic — based on the system's LOADED kernel modules, NOT the device kernel version
+# 1. 提取已加载的 vendor ko 模块文件 —— 所有 ABI section 的单一基准来源
+#    pull the LOADED vendor ko module file — the single source of all ABI section baselines
 #    uname -r 是设备 release 串，vermagic 是 vendor 模块加载器的标识，两者可能不同
 #    uname -r is the device release string; vermagic identifies the vendor module loader; they can differ
-#    必须用 modinfo 从已加载（能被内核成功识别）的 vendor 模块取得 vermagic
-#    must get vermagic via modinfo from a LOADED vendor module that the kernel accepts
+#    必须以已加载（能被内核成功识别）的 ko 为准
+#    must be based on LOADED ko files (accepted by the running kernel)
 
-# 先列出已加载的模块 / first list loaded modules
-adb shell lsmod
+adb shell lsmod   # 列出已加载模块 / list loaded modules
+adb pull /vendor/lib/modules/<已加载的vendor模块>.ko abi/vendor.ko
 
-# 从已加载的 vendor 模块获取 vermagic（ko 文件路径需根据设备实际确定）
-# get vermagic from a loaded vendor module (ko path depends on the device)
-adb shell modinfo /vendor/lib/modules/<已加载的vendor模块>.ko | grep vermagic
-# 或从 /sys/module 下已加载模块直接确认 / or confirm from loaded modules under /sys/module
-adb shell "for m in /sys/module/*/; do cat \$m/... 2>/dev/null; done"  # 依设备而定 / device-dependent
+# 2. 从已加载 ko 提取全部 ABI section / 字节段
+#    extract ALL ABI sections / byte segments from the loaded ko
 
+# 2a. vermagic（.modinfo 段）/ vermagic (.modinfo section)
+llvm-readelf -p .modinfo abi/vendor.ko | grep vermagic
 # 保存到 abi/vermagic.txt / save to abi/vermagic.txt
 
-# 2. Symbol CRC —— 从已加载的 ko 模块文件内提取，而不是 /proc/module_symvers
-#    Symbol CRC — extract from the LOADED ko module files, NOT /proc/module_symvers
-#    已加载 ko 的 __versions 段是内核实际认可的 CRC 基准
-#    the __versions section of loaded ko files is the CRC baseline the kernel actually accepts
-#    /proc/module_symvers 只作参考，不作为精确基准
-#    /proc/module_symvers is reference only, not the precise baseline
+# 2b. __versions 段（符号 CRC）/ __versions section (symbol CRCs)
+llvm-readelf -x __versions abi/vendor.ko
+# 每项：CRC(4字节) + 符号名 -> 写入 crc/Module.symvers（<crc> <symbol>）
+# each entry: CRC(4 bytes) + symbol name -> write crc/Module.symvers (<crc> <symbol>)
 
-# 把已加载的 vendor ko 拉到 PC 端 / pull the loaded vendor ko(s) to the PC
-adb pull /vendor/lib/modules/<已加载的vendor模块>.ko crc/vendor.ko
+# 2c. __version_ext_crcs / __version_ext_names 段（扩展版本 CRC 与符号名）
+#     __version_ext_crcs / __version_ext_names sections (extended version CRCs & names)
+llvm-readelf -x __version_ext_crcs abi/vendor.ko
+llvm-readelf -p __version_ext_names abi/vendor.ko
 
-# 用 readelf 解析 ko 的 __versions 段，生成 CRC 表（符号名 + CRC 值）
-# parse the __versions section with readelf to build the CRC table (symbol name + CRC)
-llvm-readelf -x __versions crc/vendor.ko   # 或 readelf / 或脚本解析 / or a script to parse
-# 解析出的每项为：CRC(4字节) + 符号名 -> 写入 crc/Module.symvers 格式
-# each entry: CRC(4 bytes) + symbol name -> write in Module.symvers format
+# 2d. .init.eh_frame / .note.Linux 等构建信息段
+#     .init.eh_frame / .note.Linux build-info sections
+llvm-readelf -S abi/vendor.ko | grep -E '__versions|__version_ext|\.init\.eh_frame|\.note\.Linux'
 
-# 保存到 crc/Module.symvers（格式：<crc> <symbol>）/ save to crc/Module.symvers (<crc> <symbol>)
+# 2e. KCFI type ID（init_module/cleanup_module 等，从已加载 ko 提取）
+#     KCFI type IDs (init_module/cleanup_module etc., extracted from the loaded ko)
+llvm-nm -a abi/vendor.ko | grep -i kcfi
 
 # 3. 内核头文件 / kernel headers
 adb shell "tar czf /data/local/tmp/kheaders.tar.gz -C /lib/modules/$(uname -r) build"
@@ -442,19 +441,27 @@ static int temp_band(void) {
 
 ### 5d. 静态核对（每次迭代必须完整触发）/ Static Verification (must fully trigger every iteration)
 
-1. **vermagic 核对 / vermagic check**：模块 vermagic == 目标设备 vermagic / module vermagic == target device vermagic
-2. **CRC 核对 / CRC check**：模块 `__versions` 段中每个符号的 CRC == 从已加载 ko 提取的 CRC 基准（`crc/Module.symvers`）/ every symbol CRC in the module's `__versions` == the CRC baseline extracted from loaded ko files (`crc/Module.symvers`)
-3. **KCFI type ID 核对 / KCFI type ID check**：`init_module`/`cleanup_module` type ID == 目标内核 / == target kernel
-4. **未声明符号检查 / undeclared symbol check**：`llvm-nm -u` 输出的符号必须都在 `__versions` 中 / symbols from `llvm-nm -u` must all be in `__versions`
-5. **section 完整性 / section completeness**：`__versions`、`__version_ext_crcs`、`__version_ext_names`、`.init.eh_frame`、`.note.Linux` 都存在 / all present
+1. **vermagic 核对 / vermagic check**：模块 vermagic == 从设备端已加载 ko 提取的 vermagic（`abi/vermagic.txt`）/ module vermagic == vermagic extracted from the loaded ko on device (`abi/vermagic.txt`)
+2. **CRC 核对 / CRC check**：模块 `__versions` 段中每个符号的 CRC == 从设备端已加载 ko 提取的 CRC 基准（`crc/Module.symvers`）/ every symbol CRC in the module's `__versions` == the CRC baseline extracted from the loaded ko (`crc/Module.symvers`)
+3. **扩展版本核对 / extended version check**：模块 `__version_ext_crcs` / `__version_ext_names` == 从设备端已加载 ko 提取的值 / module `__version_ext_crcs`/`__version_ext_names` == values extracted from the loaded ko
+4. **KCFI type ID 核对 / KCFI type ID check**：`init_module`/`cleanup_module` type ID == 从设备端已加载 ko 提取的 type ID / == KCFI type IDs extracted from the loaded ko
+5. **未声明符号检查 / undeclared symbol check**：`llvm-nm -u` 输出的符号必须都在 `__versions` 中 / symbols from `llvm-nm -u` must all be in `__versions`
+6. **section 完整性 / section completeness**：模块必须包含 `__versions`、`__version_ext_crcs`、`__version_ext_names`、`.init.eh_frame`、`.note.Linux` 等与设备端已加载 ko 一致的 section / module must contain the same ABI sections as the loaded ko (`__versions`, `__version_ext_crcs`, `__version_ext_names`, `.init.eh_frame`, `.note.Linux`)
 
 ```bash
-# 核对命令示例 / verification command examples
-$READELF -S MODULE.ko | grep -E '__versions|__version_ext'
-$NM -u MODULE.ko
+# 核对命令示例（以设备端已加载 ko = abi/vendor.ko 为基准）
+# verification examples (baseline = loaded ko on device, abi/vendor.ko)
+
+# section 列表逐项对比 / compare section lists
+$READELF -S MODULE.ko | grep -E '__versions|__version_ext|\.init\.eh_frame|\.note\.Linux'
+llvm-readelf -S abi/vendor.ko | grep -E '__versions|__version_ext|\.init\.eh_frame|\.note\.Linux'
+
+# KCFI type ID 对比 / compare KCFI type IDs
 $NM -a MODULE.ko | grep '__kcfi_typeid_init_module'
-# CRC 核对脚本（从已加载 ko 提取的 CRC 基准逐符号对比）
-# CRC check script (compare symbol by symbol against the CRC baseline extracted from loaded ko files)
+llvm-nm -a abi/vendor.ko | grep -i kcfi
+
+# CRC 核对脚本（对设备端已加载 ko 提取的 CRC 基准逐符号对比）
+# CRC check script (compare symbol by symbol against CRC baseline from the loaded ko)
 ```
 
 **任一核对失败 → 停下修复，不进入 insmod。**
