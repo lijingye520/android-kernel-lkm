@@ -183,41 +183,102 @@ project-root/
 
 ---
 
-## Phase 3：符号发现 / Symbol Discovery
+## Phase 3：符号发现与 hook 定位 / Symbol Discovery & Hook Targeting
 
-根据需求在 kallsyms 中搜索相关函数 / Search relevant functions in kallsyms based on requirements:
+**先判断定位路径：符号名已知 还是 未知。**
+**First decide the targeting path: known symbol name, or unknown.**
+
+### 3a. 符号名已知（框架固定符号）/ Known Symbol Name (fixed framework symbols)
+
+许多目标函数属于厂商/SoC 固定框架（如小米 `mca_*` 充电框架、Qualcomm `dsi_*` 显示框架），符号名是公开/确定的。此时只需：
+
+```bash
+# 在 kallsyms 中确认符号存在且未被剥离 / confirm in kallsyms that the symbol exists and is not stripped
+grep 'platform_class_buckchg_ops_set_ichg' kallsyms.txt
+grep 'mca_quick_charge_div4_single_voter_cb' kallsyms.txt
+grep 'dsi_panel_get_mode' kallsyms.txt
+```
+
+### 3b. 符号名未知（需搜索定位）/ Unknown Symbol Name (search to locate)
+
+按需求关键字在 kallsyms 中搜索候选函数：
 
 ```bash
 # 充电相关 / charging related
 grep -E 'platform_class_buckchg|mca_quick_charge|fg_update_status|strategy_fg_ops' kallsyms.txt
 
 # 显示相关 / display related
-grep -E 'dsi_panel|dsi_display|mtk_dsi' kallsyms.txt
+grep -E 'dsi_panel|dsi_display|mtk_dsi|porch_setting|get_mode_enum' kallsyms.txt
 
 # 热控相关 / thermal related
-grep -E 'thermal_zone_get_temp|power_supply_get_property' kallsyms.txt
+grep -E 'thermal_zone_get_temp|power_supply_get_property|strategy_class_fg_ops' kallsyms.txt
 ```
 
-- 确认目标符号存在 / confirm target symbols exist
-- 通过反汇编确认函数签名（参数数量、类型）/ confirm function signatures via disassembly (param count, types)
+必要时用 `_kallsyms_lookup_name` 在模块内动态解析符号地址（PMB110 方式）：
+```c
+unsigned long sym = _kallsyms_lookup_name("oplus_display0_params");
+```
+
+### 3c. 确认函数签名与参数 / Confirm Signature & Arguments
+
+- 反汇编候选函数，确认参数数量、类型 / disassemble, confirm param count & types
 - 确定 ARM64 寄存器映射 / determine ARM64 register mapping:
   - `regs->regs[0]` = x0 = 第 1 参数 / 1st argument
   - `regs->regs[1]` = x1 = 第 2 参数 / 2nd argument
   - `regs->regs[2]` = x2 = 第 3 参数 / 3rd argument
   - `regs->regs[3]` = x3 = 第 4 参数 / 4th argument
+- **KCFI type ID 验证（关键）**：从函数入口前 4 字节读取 type hash，与本地函数对比，确认签名匹配（PMB110 方式）：
+  ```c
+  static int read_kcfi_type(const void *fn, u32 *type_id) {
+      return copy_from_kernel_nofault(type_id,
+          (void *)((unsigned long)fn - sizeof(*type_id)), sizeof(*type_id));
+  }
+  static int validate_kcfi(const void *live, const void *local) {
+      u32 a, b;
+      if (read_kcfi_type(live, &a) || read_kcfi_type(local, &b))
+          return -EFAULT;
+      return a == b ? 0 : -EINVAL;
+  }
+  ```
+
+### 3d. 运行时 observe 确认未知枚举值 / Confirm Unknown Enum Values via observe at Runtime
+
+当字段/属性使用未知枚举值时（如某固件的 `POWER_SUPPLY_PROP_TEMP` 不是标准值 9 而是厂商值），用 observe 模式在运行时打印确认（K90ULTRA Chg 方式）：
+
+```c
+// probe 中打印实际传入的枚举值 / print actual enum value in probe
+pr_info("ps_get_prop psp=%lu\n", regs->regs[1]);
+// observe=1 运行时观察，从日志确认目标属性的真实枚举值
+// with observe=1, confirm the real enum value from logs
+```
 
 ---
 
 ## Phase 4：结构布局发现（如需内存改写）/ Struct Layout Discovery (if memory modification needed)
 
-如果修改涉及结构体字段（如 vcutoff、min_vbat、温度值）：
-If modification involves struct fields (e.g., vcutoff, min_vbat, temperature):
-- 反汇编 vendor 驱动，从 `parse_dt` 或初始化函数定位字段偏移
-  Disassemble vendor drivers, locate field offsets from `parse_dt` or init functions.
-- 记录：偏移值、字段类型（u32/u64/指针）、单位、原值/目标值
-  Record: offset, field type (u32/u64/pointer), unit, original/target value.
-- **偏移必须在设备上验证**，不能直接照搬其他项目的
-  **Offsets must be verified on the device**, don't copy from other projects directly.
+如果修改涉及结构体字段（如 vcutoff、min_vbat、温度值、模式对象），字段偏移可用以下**多来源方法**定位，相互印证：
+
+If modification involves struct fields (e.g., vcutoff, min_vbat, temperature, mode objects), locate field offsets via these **multi-source methods**, corroborating each other:
+
+1. **反汇编 parse_dt/初始化函数**：从设备驱动的 DTS 解析代码中定位字段写入偏移（K90ULTRA Chg 的 quick_ctx `0x374/0x430` 即从 `parse_dt` 反汇编得到）
+   **Disassemble parse_dt/init functions**: locate the offset where fields are written from DTS parsing code (K90ULTRA Chg's quick_ctx `0x374/0x430` came from `parse_dt` disassembly).
+2. **运行时 dump**：dump 结构体内存，对照已知字段值与偏移（K90ULTRA Chg 的 FG vcutoff `0x9c8/0x9d0` 从运行时 dump 定位）
+   **Runtime dump**: dump struct memory, match known field values to offsets (FG vcutoff `0x9c8/0x9d0` located via runtime dump).
+3. **观察活动路径**：对显示等驱动，观察枚举/切换时的实际内存布局（K90ULTRA Display 的 mode 对象前缀、panel 计数偏移 `0x5a8/0x5ac`、`display+0x318` 来自 `msm_drm.ko` 反汇编 + 活动路径观察）
+   **Observe active paths**: for display drivers, observe actual memory layout during enumeration/switching (mode object prefix, panel count offsets, display modes pointer from `msm_drm.ko` disassembly + active path observation).
+4. **函数指针扫描**：当需要替换回调时，用 KCFI type ID 在结构体内扫描定位函数指针槽位（PMB110 的 `find_vdo_update_slot` 扫描 2048 字节找唯一匹配）
+   **Function pointer scanning**: when replacing a callback, scan the struct with KCFI type ID to locate the function pointer slot (PMB110's `find_vdo_update_slot` scans 2048 bytes for the only match).
+5. **强验证**：加载前验证面板名、模式几何、CRC 等基线（PMB110 用 `mode_matches()` 精确匹配 hdisplay/vdisplay/hsync/htotal/vtotal/clock；K90ULTRA Display 验证 165Hz 时序常量）
+   **Strong validation**: verify panel name, mode geometry, CRC baseline before loading (PMB110 uses `mode_matches()` exact-match on display timing; K90ULTRA Display validates 165Hz timing constants).
+
+记录 / Record:
+- 偏移值 / offset
+- 字段类型（u32/u64/指针）/ field type (u32/u64/pointer)
+- 单位 / unit
+- 原值/目标值 / original/target value
+
+**偏移必须在设备上验证，不能直接照搬其他项目的。**
+**Offsets must be verified on the device**, don't copy from other projects directly.
 
 ---
 
