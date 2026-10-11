@@ -102,8 +102,8 @@ Combine GitHub approaches with device reality to form your own judgment:
 与用户确认 / Confirm with the user:
 - **修改目标**：要改什么？（充电电流/CV 电压/刷新率/温度/热控/其他）
   **Modification target**: what to change? (charging current/CV voltage/refresh rate/temperature/thermal/other)
-- **目标值**：期望的最终结果（如电流 19.4A、刷新率 185Hz）
-  **Target values**: expected final result (e.g., current 19.4A, refresh rate 185Hz)
+- **目标值**：期望的最终结果（具体数值、单位、允许范围）
+  **Target values**: expected final result (value, unit, acceptable range)
 - **目标设备**：设备代号、SoC 平台、内核版本
   **Target device**: device codename, SoC platform, kernel version
 - **迭代目标列表**：把大目标分解为多个小目标（最小探针 → 逐步推进）
@@ -126,6 +126,16 @@ Combine GitHub approaches with device reality to form your own judgment:
 adb shell lsmod   # 列出已加载模块 / list loaded modules
 adb pull /vendor/lib/modules/<已加载的vendor模块>.ko abi/vendor.ko
 
+# 有的厂商把模块放在 vendor_boot ramdisk 里，不在 /vendor/lib/modules；先把真实路径查出来
+# some vendors keep modules in the vendor_boot ramdisk, not vendor_dlkm; find the real path first
+adb shell 'ls /lib/modules/ 2>/dev/null; find / -name "<vendor-module>.ko" 2>/dev/null | head -5'
+
+# 拿到后先核对 build id / vermagic：不一致就是镜像拿错了，不要继续比对偏移
+# verify build id / vermagic first: a mismatch means the wrong image, stop comparing offsets
+python3 scripts/extract-abi.py abi/vendor.ko
+# 详细核对流程见 references/abi-provenance.md
+# see references/abi-provenance.md for image-vs-device provenance checks
+
 # 2. 从已加载 ko 提取全部 ABI section / 字节段
 #    extract ALL ABI sections / byte segments from the loaded ko
 
@@ -135,8 +145,11 @@ llvm-readelf -p .modinfo abi/vendor.ko | grep vermagic
 
 # 2b. __versions 段（符号 CRC）/ __versions section (symbol CRCs)
 llvm-readelf -x __versions abi/vendor.ko
-# 每项：CRC(4字节) + 符号名 -> 写入 crc/Module.symvers（<crc> <symbol>）
-# each entry: CRC(4 bytes) + symbol name -> write crc/Module.symvers (<crc> <symbol>)
+# 注意：__versions 是 64 字节定长项，CRC 在前 4 字节，符号名从偏移 8 开始
+# note: __versions entries are 64 bytes; CRC in the first 4, symbol name at offset 8
+# 手写 hex 解析很容易错位，直接用脚本：
+# hand-parsing the hex desyncs easily; use the script:
+python3 scripts/extract-abi.py abi/vendor.ko --module-symvers crc/Module.symvers
 
 # 2c. __version_ext_crcs / __version_ext_names 段（扩展版本 CRC 与符号名）
 #     __version_ext_crcs / __version_ext_names sections (extended version CRCs & names)
@@ -233,15 +246,15 @@ grep 'dsi_panel_get_mode' kallsyms.txt
 grep -E 'platform_class_buckchg|mca_quick_charge|fg_update_status|strategy_fg_ops' kallsyms.txt
 
 # 显示相关 / display related
-grep -E 'dsi_panel|dsi_display|mtk_dsi|porch_setting|get_mode_enum' kallsyms.txt
+grep -E 'panel|display|dsi|porch|mode_switch' kallsyms.txt
 
 # 热控相关 / thermal related
 grep -E 'thermal_zone_get_temp|power_supply_get_property|strategy_class_fg_ops' kallsyms.txt
 ```
 
-必要时用 `_kallsyms_lookup_name` 在模块内动态解析符号地址（PMB110 方式）：
+必要时用 `_kallsyms_lookup_name` 在模块内动态解析符号地址：
 ```c
-unsigned long sym = _kallsyms_lookup_name("oplus_display0_params");
+unsigned long sym = _kallsyms_lookup_name("<vendor_symbol_name>");
 ```
 
 ### 3c. 确认函数签名与参数 / Confirm Signature & Arguments
@@ -252,7 +265,7 @@ unsigned long sym = _kallsyms_lookup_name("oplus_display0_params");
   - `regs->regs[1]` = x1 = 第 2 参数 / 2nd argument
   - `regs->regs[2]` = x2 = 第 3 参数 / 3rd argument
   - `regs->regs[3]` = x3 = 第 4 参数 / 4th argument
-- **KCFI type ID 验证（关键）**：从函数入口前 4 字节读取 type hash，与本地函数对比，确认签名匹配（PMB110 方式）：
+- **KCFI type ID 验证（关键）**：从函数入口前 4 字节读取 type hash，与本地函数对比，确认签名匹配：
   ```c
   static int read_kcfi_type(const void *fn, u32 *type_id) {
       return copy_from_kernel_nofault(type_id,
@@ -266,9 +279,25 @@ unsigned long sym = _kallsyms_lookup_name("oplus_display0_params");
   }
   ```
 
+- **校验通过 ≠ 调用安全**：签名一致不代表实参语义正确（结构体字段可能还没初始化）、
+  调用时机安全（枚举期 vs 点亮后），也不代表槽位扫出来的就是你想要的那个函数。
+  **Validated ≠ safe**: a matching signature says nothing about argument semantics, call timing,
+  or whether the scanned slot is the function you meant.
+- **只被直接调用、从未取地址的函数没有 KCFI 前缀**：厂商 static 函数就是这种，
+  `validate_kcfi()` 对它们必然返回 `-EINVAL`。别把它当硬门槛，记录结果 + 用别的证据
+  （符号名、函数长度、反汇编窗口）确认地址后直调，直调走 `__nocfi` 蹦床。
+  **Address-never-taken functions have no KCFI prefix**: vendor static functions qualify, and
+  `validate_kcfi()` will always return `-EINVAL` for them. Log the result, confirm the address
+  another way (symbol name, size, disassembly window), then call through a `__nocfi` trampoline.
+
+厂商分派层的前置检查、枚举编号整段位移、双编号探测策略等实战细节见
+[references/kcfi-and-dispatch.md](references/kcfi-and-dispatch.md)。
+Vendor pre-switch guards, index shifts, and dual-numbering probes are covered in
+[references/kcfi-and-dispatch.md](references/kcfi-and-dispatch.md).
+
 ### 3d. 运行时 observe 确认未知枚举值 / Confirm Unknown Enum Values via observe at Runtime
 
-当字段/属性使用未知枚举值时（如某固件的 `POWER_SUPPLY_PROP_TEMP` 不是标准值 9 而是厂商值），用 observe 模式在运行时打印确认（K90ULTRA Chg 方式）：
+当字段/属性使用未知枚举值时（如某固件的 `POWER_SUPPLY_PROP_TEMP` 不是标准值 9 而是厂商值），用 observe 模式在运行时打印确认：
 
 ```c
 // probe 中打印实际传入的枚举值 / print actual enum value in probe
@@ -285,16 +314,23 @@ pr_info("ps_get_prop psp=%lu\n", regs->regs[1]);
 
 If modification involves struct fields (e.g., vcutoff, min_vbat, temperature, mode objects), locate field offsets via these **multi-source methods**, corroborating each other:
 
-1. **反汇编 parse_dt/初始化函数**：从设备驱动的 DTS 解析代码中定位字段写入偏移（K90ULTRA Chg 的 quick_ctx `0x374/0x430` 即从 `parse_dt` 反汇编得到）
-   **Disassemble parse_dt/init functions**: locate the offset where fields are written from DTS parsing code (K90ULTRA Chg's quick_ctx `0x374/0x430` came from `parse_dt` disassembly).
-2. **运行时 dump**：dump 结构体内存，对照已知字段值与偏移（K90ULTRA Chg 的 FG vcutoff `0x9c8/0x9d0` 从运行时 dump 定位）
-   **Runtime dump**: dump struct memory, match known field values to offsets (FG vcutoff `0x9c8/0x9d0` located via runtime dump).
-3. **观察活动路径**：对显示等驱动，观察枚举/切换时的实际内存布局（K90ULTRA Display 的 mode 对象前缀、panel 计数偏移 `0x5a8/0x5ac`、`display+0x318` 来自 `msm_drm.ko` 反汇编 + 活动路径观察）
-   **Observe active paths**: for display drivers, observe actual memory layout during enumeration/switching (mode object prefix, panel count offsets, display modes pointer from `msm_drm.ko` disassembly + active path observation).
-4. **函数指针扫描**：当需要替换回调时，用 KCFI type ID 在结构体内扫描定位函数指针槽位（PMB110 的 `find_vdo_update_slot` 扫描 2048 字节找唯一匹配）
-   **Function pointer scanning**: when replacing a callback, scan the struct with KCFI type ID to locate the function pointer slot (PMB110's `find_vdo_update_slot` scans 2048 bytes for the only match).
-5. **强验证**：加载前验证面板名、模式几何、CRC 等基线（PMB110 用 `mode_matches()` 精确匹配 hdisplay/vdisplay/hsync/htotal/vtotal/clock；K90ULTRA Display 验证 165Hz 时序常量）
-   **Strong validation**: verify panel name, mode geometry, CRC baseline before loading (PMB110 uses `mode_matches()` exact-match on display timing; K90ULTRA Display validates 165Hz timing constants).
+1. **反汇编 parse_dt/初始化函数**：从设备驱动的 DTS 解析代码中定位字段写入偏移
+   **Disassemble parse_dt/init functions**: locate the offset where fields are written from DTS parsing code.
+2. **运行时 dump**：dump 结构体内存，对照已知字段值与偏移
+   **Runtime dump**: dump struct memory and match known field values to offsets.
+3. **观察活动路径**：对显示等驱动，观察枚举/切换时的实际内存布局，与静态反汇编结果对照
+   **Observe active paths**: for display drivers, observe the actual memory layout during enumeration/switching and cross-check it against the static disassembly.
+4. **函数指针扫描**：当需要替换回调时，用 KCFI type ID 在结构体内扫描定位函数指针槽位，只接受唯一匹配
+   **Function pointer scanning**: when replacing a callback, scan the struct with the KCFI type ID to locate the slot; only a unique match is usable.
+5. **强验证**：加载前验证面板名、模式几何、CRC 等基线，全部匹配才允许继续
+   **Strong validation**: verify panel name, mode geometry, and CRC baselines before loading; require an exact match to proceed.
+6. **头文件布局与真机反汇编双向核对**：用 `clang -fdump-record-layouts` 打印本地头文件的字段偏移，
+   再去厂商 ko 里找写同一字段的指令立即数。两边对上了才能确信头文件描述的就是运行内核；
+   对不上时先怀疑头文件来源，不要怀疑设备。验证结论写进文档，下次不用重做。
+   **Cross-check header layout against device disassembly**: dump field offsets from the local headers
+   with `clang -fdump-record-layouts`, then find the immediate offsets the vendor ko writes for the same
+   fields. Only matching values prove the headers describe the running kernel; when they differ, suspect
+   the header source, not the device. Record the result so it doesn't get redone.
 
 记录 / Record:
 - 偏移值 / offset
@@ -512,8 +548,18 @@ Must verify from **multiple dimensions**, not rely on a single piece of evidence
 
 ```bash
 # 推送并加载 / push and load
+adb shell getprop ro.product.model   # 先确认是目标机型 / confirm this is the target model
 adb push out/MODULE.ko /data/local/tmp/
+
 adb shell su -c "insmod /data/local/tmp/MODULE.ko enabled=1 observe=1"
+
+# insmod 后先确认模块真的驻留在内核里；rc=0 不等于加载成功（可能被自禁用脚本跳过）
+# after insmod, confirm the module is actually resident; rc=0 doesn't mean it loaded
+adb shell su -c "ls /sys/module/MODULE_NAME/"
+
+# 一轮只改一个变量，并把本轮 KO 的 hash 一起记下，事后才能确认设备跑的是哪一版
+# change one variable per round and record this round's KO hash
+shasum -a 256 out/MODULE.ko
 
 # 维度1：检查是否加载成功 + hook 注册 / dimension 1: loaded + hook registered
 adb shell su -c "ls /sys/module/MODULE_NAME/"
@@ -527,10 +573,9 @@ adb shell su -c "cat /sys/class/power_supply/battery/voltage_now"   # 实际电�
 adb shell su -c "cat /sys/class/power_supply/battery/temp"          # 实际温度 / actual temperature
 adb shell su -c "for tz in /sys/class/thermal/thermal_zone*/; do echo \"$tz: $(cat $tz/type) = $(cat $tz/temp)\"; done"  # 热区 / thermal zones
 
-# 维度3：实际行为效果 —— 物理/功能层面（以显示超频为例）
-# dimension 3: real behavior effect — physical/functional level (display overclock example)
-adb shell su -c "dumpsys SurfaceFlinger --display-id 0"   # 模式列表是否含新模式 / new modes present?
-adb shell su -c "cat /sys/module/MODULE_NAME/parameters/te_count"  # TE 是否按目标刷新率增长 / TE rising at target rate?
+# 维度3：实际行为效果 —— 物理/功能层面（按实际需求换成对应节点/命令）
+# dimension 3: real behavior effect — use the nodes/commands that fit the requirement
+adb shell su -c "cat /sys/module/MODULE_NAME/parameters/<counter>"  # 对照目标行为持续观察 / observe the counter against the target behavior
 
 # 维度4：综合判断 —— 多个维度相互印证，全部吻合才算生效
 # dimension 4: combined judgment — multiple dimensions corroborate; only when all match is it effective
@@ -541,8 +586,8 @@ adb shell su -c "cat /sys/module/MODULE_NAME/parameters/te_count"  # TE 是否�
   Charging current: not just `ichg_hits > 0`; `battery/current_now` must actually reach the target and stay stable.
 - 温度伪装：不能只看 `temp_spoof_hits > 0`，必须 `battery/temp`、thermal_zone、FG 读数都显示伪装值
   Temp spoof: not just `temp_spoof_hits > 0`; battery/temp, thermal zone, and FG readings must all show the spoofed value.
-- 显示超频：不能只看模式枚举数增加，必须 `te_count` 按 176/185Hz 速率增长、无 timeout/underrun/黑屏花屏
-  Display overclock: not just mode count increase; `te_count` must rise at 176/185Hz rate with no timeout/underrun/black/flicker.
+- 显示类修改：不能只看模式枚举或计数增加，必须在目标时序下连续运行，无 timeout/underrun/黑屏花屏
+  Display changes: not just mode count or counter increase; it must run continuously under the target timing with no timeout/underrun/black screen/artifacts.
 
 **通过标准：本轮迭代的既定工作目标完成，且经设备实际节点 + 实际行为效果综合验证成立。**
 **Pass criteria: this iteration's defined working goal is complete AND corroborated by device actual nodes + real behavior effect.**
@@ -564,6 +609,10 @@ adb shell su -c "cat /sys/module/MODULE_NAME/parameters/te_count"  # TE 是否�
 | Unknown symbol | 缺少符号 CRC / missing symbol CRC |
 | probe 注册失败 -2 / probe register fails -2 | 符号不在 kallsyms / symbol not in kallsyms |
 | 加载成功但无效果 / loaded but no effect | enabled=0 或符号名错误 / enabled=0 or wrong symbol name |
+| 加载成功、命令返回 0、但副作用全无 / loads, call returns 0, nothing happened | 厂商分派层前置检查 early-return，或枚举编号位移打到了另一个 case / vendor pre-switch guard, or a shifted index landed in another case |
+| 参数变成指针残值、NULL 解引用 panic / argument looks like a pointer remnant, NULL deref panic | 命令编号位移，参数被当成另一种类型解引用 / shifted command index, argument reinterpreted |
+| 崩溃在厂商回调内部，栈顶是别人的函数 / crash inside vendor callback | 签名对上了但调用时机/实参语义不安全 / signature matches but timing/arguments unsafe |
+| 重新加载后立刻 use-after-free / use-after-free right after reload | 失败路径没把注入的指针还回原值就 module_put / rollback skipped pointer restoration before module_put |
 
 ### 5f. 迭代结束条件 / Iteration End Condition
 
@@ -583,6 +632,10 @@ adb shell su -c "cat /sys/module/MODULE_NAME/parameters/te_count"  # TE 是否�
 - 偏移注入：先验证原值再改写 / offset injection: verify original value before writing
 - 并发安全：probe handler 中无 mutex/kmalloc(GFP_KERNEL)/msleep / concurrency safety: no mutex/kmalloc(GFP_KERNEL)/msleep in probe handlers
 - 错误处理：probe 注册失败有回滚 / error handling: rollback on probe registration failure
+- 回滚完整性：每次把自己替换的指针（回调、参数表、链表节点）都恢复成原值。
+  自引用 `try_module_get()` 只挡 `rmmod`，挡不住 init 失败返回时的卸载。
+  Rollback completeness: restore every pointer you replaced (callbacks, params tables, list nodes).
+  A self-ref from `try_module_get()` blocks `rmmod`, not the unload on a failed init return.
 - 日志频率：observe 开关控制，不刷屏 / log frequency: controlled by observe switch, no spam
 
 ### 6b. 需求实现度审查 / Requirements Fulfillment Review
@@ -684,3 +737,18 @@ sha256sum ../MODULE_NAME-KernelSU.zip
 9. probe handler 中使用 mutex/kmalloc(GFP_KERNEL)/msleep / Use mutex/kmalloc(GFP_KERNEL)/msleep in probe handlers
 10. 不验证原值直接改写内存 / Modify memory without verifying original value
 11. 日志不限制频率（回调频率很高）/ Unrestricted logging (callbacks are high-frequency)
+12. 用镜像里解出的 vendor ko 当基线，却不核对它是不是设备实际加载的那份
+    / Treat a ko unpacked from an image as the baseline without checking it is the one loaded
+13. 把 KCFI 校验失败当成“地址错了”——从未取地址的 static 函数没有前缀，失败是预期的
+    / Read a KCFI validation failure as "wrong address": address-never-taken statics have no prefix
+
+## 参考文件 / References
+
+按需阅读，不要一次全加载 / read on demand, don't load all at once:
+
+| 文件 / File | 何时读 / When |
+|------|------|
+| [references/abi-provenance.md](references/abi-provenance.md) | 从镜像解包 vendor ko、怀疑基线不是设备真身、要让日志自带 ABI 证据 / unpacking from images, suspecting the baseline isn't the live module, or making logs carry their own ABI evidence |
+| [references/kcfi-and-dispatch.md](references/kcfi-and-dispatch.md) | 换厂商回调、按类型扫槽位、命令编号可能整体位移 / replacing vendor callbacks, typed slot scanning, suspicious index shifts |
+| [references/rollback-and-forensics.md](references/rollback-and-forensics.md) | 失败回滚、崩溃取证、日志抓不到厂商输出、刷入循环失控 / rollback, crash forensics, missing vendor logs, runaway flash loops |
+| [scripts/extract-abi.py](scripts/extract-abi.py) | 从任何 .ko 抽取 vermagic / build id / `__versions` / `__version_ext` / extracting ABI sections from any .ko |
